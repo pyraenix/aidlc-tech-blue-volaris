@@ -16,23 +16,23 @@ module "network" {
 }
 
 module "security" {
-  source                       = "./modules/security"
-  name_prefix                  = local.name_prefix
-  waf_rate_limit_per_5min      = var.waf_rate_limit_per_5min
-  otp_send_rate_limit_per_5min = var.otp_send_rate_limit_per_5min
+  source                  = "./modules/security"
+  name_prefix             = local.name_prefix
+  waf_rate_limit_per_5min = var.waf_rate_limit_per_5min
   providers = {
     aws.use1 = aws.use1
   }
 }
 
-# --- Identity (Cognito email-OTP passwordless) ------------------------------
+# --- Identity (self-hosted Keycloak, external — email-OTP owned by Keycloak) -
 module "identity" {
-  source                        = "./modules/identity"
-  name_prefix                   = local.name_prefix
-  otp_email_from                = var.otp_email_from
-  otp_code_ttl_seconds          = var.otp_code_ttl_seconds
-  access_token_validity_minutes = var.access_token_validity_minutes
-  app_domains                   = var.app_domains
+  source                 = "./modules/identity"
+  name_prefix            = local.name_prefix
+  keycloak_issuer        = var.keycloak_issuer
+  keycloak_audience      = var.keycloak_audience
+  keycloak_roles_claim   = var.keycloak_roles_claim
+  reviewer_approver_role = var.reviewer_approver_role
+  reviewer_editor_role   = var.reviewer_editor_role
 }
 
 # --- State: durable (DynamoDB) + ephemeral draft (Redis) --------------------
@@ -56,14 +56,13 @@ module "data" {
   name_prefix = local.name_prefix
 }
 
-# --- API edge (API Gateway + JWT authorizer + presign) ----------------------
+# --- API edge (API Gateway + Keycloak JWT authorizer + presign) -------------
 module "api" {
   source              = "./modules/api"
   name_prefix         = local.name_prefix
-  region              = var.region
   app_domains         = var.app_domains
-  user_pool_id        = module.identity.user_pool_id
-  user_pool_client_id = module.identity.user_pool_client_id
+  keycloak_issuer     = module.identity.keycloak_issuer
+  keycloak_audience   = module.identity.keycloak_audience
   raw_videos_bucket   = module.storage.raw_videos_bucket_name
   max_upload_mb       = var.max_upload_mb
   listings_table_arn  = module.data.listings_table_arn
@@ -76,15 +75,18 @@ module "api" {
 
 # --- Integration layer (in-house video agent + upstream data + Bedrock) -----
 module "integration" {
-  source              = "./modules/integration"
-  name_prefix         = local.name_prefix
-  frames_bucket       = module.storage.frames_bucket_arn
-  frames_bucket_name  = module.storage.frames_bucket_name
-  raw_videos_bucket   = module.storage.raw_videos_bucket_arn
-  listings_table_arn  = module.data.listings_table_arn
-  listings_table_name = module.data.listings_table_name
-  bedrock_model_id    = var.bedrock_model_id
-  region              = var.region
+  source             = "./modules/integration"
+  name_prefix        = local.name_prefix
+  frames_bucket      = module.storage.frames_bucket_arn
+  frames_bucket_name = module.storage.frames_bucket_name
+  bedrock_model_id   = var.bedrock_model_id
+  region             = var.region
+
+  # REST integrations: base URLs are config, API keys go into the connections.
+  upstream_data_base_url = var.upstream_data_base_url
+  upstream_data_api_key  = var.upstream_data_api_key
+  video_agent_base_url   = var.video_agent_base_url
+  video_agent_api_key    = var.video_agent_api_key
 }
 
 # --- Orchestration (Step Functions HITL) ------------------------------------
@@ -93,15 +95,20 @@ module "workflow" {
   name_prefix                 = local.name_prefix
   listings_table_name         = module.data.listings_table_name
   listings_table_arn          = module.data.listings_table_arn
-  frames_bucket_name          = module.storage.frames_bucket_name
   event_bus_name              = module.events.event_bus_name
   event_bus_arn               = module.events.event_bus_arn
-  fetch_input_data_fn_arn     = module.integration.fetch_input_data_fn_arn
-  invoke_video_agent_fn_arn   = module.integration.invoke_video_agent_fn_arn
   generate_description_fn_arn = module.integration.generate_description_fn_arn
   submit_for_review_fn_arn    = module.api.submit_for_review_fn_arn
   owner_notify_topic_arn      = module.events.owner_notify_topic_arn
   ops_notify_topic_arn        = module.events.ops_notify_topic_arn
+
+  # Native HTTP Task integrations (connections + endpoints).
+  upstream_data_base_url              = var.upstream_data_base_url
+  upstream_data_connection_arn        = module.integration.upstream_data_connection_arn
+  upstream_data_connection_secret_arn = module.integration.upstream_data_connection_secret_arn
+  video_agent_base_url                = var.video_agent_base_url
+  video_agent_connection_arn          = module.integration.video_agent_connection_arn
+  video_agent_connection_secret_arn   = module.integration.video_agent_connection_secret_arn
 }
 
 # --- Event bus + notifications + S3->SFN trigger ----------------------------

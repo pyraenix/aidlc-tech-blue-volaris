@@ -1,7 +1,0 @@
-{
-  "name": "techblue-invoke-video-agent",
-  "version": "1.0.0",
-  "private": true,
-  "main": "index.js",
-  "dependencies": { "@aws-sdk/client-secrets-manager": "^3.600.0" }
-}

@@ -1,6 +1,5 @@
 variable "name_prefix" { type = string }
 variable "waf_rate_limit_per_5min" { type = number }
-variable "otp_send_rate_limit_per_5min" { type = number }
 
 # ===========================================================================
 # Two WAF ACLs are required because scope differs:
@@ -78,39 +77,10 @@ resource "aws_wafv2_web_acl" "regional" {
     }
   }
 
-  # Tight rate limit for the unauthenticated OTP-request path (anti brute-force
-  # / anti mail-flood). Scoped to the /auth/request-otp URI.
-  rule {
-    name     = "OtpRequestRateLimit"
-    priority = 4
-    action {
-      block {}
-    }
-    statement {
-      rate_based_statement {
-        limit              = var.otp_send_rate_limit_per_5min
-        aggregate_key_type = "IP"
-        scope_down_statement {
-          byte_match_statement {
-            search_string         = "/auth/request-otp"
-            positional_constraint = "STARTS_WITH"
-            field_to_match {
-              uri_path {}
-            }
-            text_transformation {
-              priority = 0
-              type     = "LOWERCASE"
-            }
-          }
-        }
-      }
-    }
-    visibility_config {
-      cloudwatch_metrics_enabled = true
-      metric_name                = "${var.name_prefix}-otp-ratelimit"
-      sampled_requests_enabled   = true
-    }
-  }
+  # Note: the previous OtpRequestRateLimit rule (scoped to /auth/request-otp) was
+  # removed with the move to Keycloak. Login and email-OTP are now owned by the
+  # self-hosted Keycloak, so no OTP-request route exists on this API to protect;
+  # brute-force / mail-flood throttling for OTP belongs at Keycloak's edge.
 
   visibility_config {
     cloudwatch_metrics_enabled = true

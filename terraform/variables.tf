@@ -36,22 +36,35 @@ variable "app_domains" {
   type        = list(string)
 }
 
-# --- Auth (Cognito email-OTP) ----------------------------------------------
-variable "otp_email_from" {
-  description = "Verified SES sender address used to email the 6-digit code."
+# --- Auth (self-hosted Keycloak) -------------------------------------------
+# The ecosystem's own Keycloak owns login, including passwordless email-OTP.
+# This app only validates the JWTs Keycloak issues. Set these per environment.
+variable "keycloak_issuer" {
+  description = "Keycloak realm OIDC issuer URL, e.g. https://sso.example/realms/<realm>. Must be publicly reachable so API Gateway can fetch JWKS."
   type        = string
 }
 
-variable "otp_code_ttl_seconds" {
-  description = "How long a 6-digit code stays valid."
-  type        = number
-  default     = 300
+variable "keycloak_audience" {
+  description = "Expected 'aud' claim value(s) — the Keycloak client ID(s) tokens are accepted for."
+  type        = list(string)
 }
 
-variable "access_token_validity_minutes" {
-  description = "Cognito access-token lifetime."
-  type        = number
-  default     = 15
+variable "keycloak_roles_claim" {
+  description = "JWT claim path carrying reviewer roles ('realm_access.roles' for realm roles, or 'resource_access.<client>.roles' for client roles)."
+  type        = string
+  default     = "realm_access.roles"
+}
+
+variable "reviewer_approver_role" {
+  description = "Keycloak role granting approve/reject authority in the reviewer console."
+  type        = string
+  default     = "listing-approver"
+}
+
+variable "reviewer_editor_role" {
+  description = "Keycloak role granting draft-edit (not final-approve) authority."
+  type        = string
+  default     = "listing-editor"
 }
 
 # --- Video / processing -----------------------------------------------------
@@ -73,6 +86,34 @@ variable "bedrock_model_id" {
   default     = "anthropic.claude-3-5-sonnet-20241022-v2:0"
 }
 
+# --- REST integrations (native Step Functions HTTP Tasks) -------------------
+# Base URLs are non-secret config. The API keys are sensitive and are stored in
+# EventBridge API Connections (connection-managed Secrets Manager secret),
+# injected as the x-api-key header by the HTTP Task — never baked into the
+# state-machine definition. Prefer passing the keys via TF_VAR_* env vars or a
+# secure tfvars rather than committing them.
+variable "upstream_data_base_url" {
+  description = "Base URL of the upstream EPC/compliance data app, e.g. https://data.example."
+  type        = string
+}
+
+variable "upstream_data_api_key" {
+  description = "API key for the upstream data app (stored in its API Connection)."
+  type        = string
+  sensitive   = true
+}
+
+variable "video_agent_base_url" {
+  description = "Base URL of TechBlue's in-house video->image agent, e.g. https://video-agent.example."
+  type        = string
+}
+
+variable "video_agent_api_key" {
+  description = "API key for the video agent (stored in its API Connection)."
+  type        = string
+  sensitive   = true
+}
+
 # --- Networking (ElastiCache lives in a VPC) --------------------------------
 variable "vpc_cidr" {
   description = "CIDR for the platform VPC."
@@ -85,12 +126,6 @@ variable "waf_rate_limit_per_5min" {
   description = "AWS WAF rate-based rule threshold (requests / 5 min / IP)."
   type        = number
   default     = 2000
-}
-
-variable "otp_send_rate_limit_per_5min" {
-  description = "Tighter WAF rate limit for the unauthenticated OTP-request route."
-  type        = number
-  default     = 100
 }
 
 # --- Publishing partners ----------------------------------------------------

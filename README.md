@@ -12,27 +12,29 @@ residency.
 
 ## Ecosystem integration (this component's boundaries)
 
-This app does **not** own video processing or publishing. It integrates with
-three external systems over REST:
+This app does **not** own identity, video processing, or publishing. It
+integrates with the surrounding ecosystem over standard protocols:
 
 | External system | Direction | What crosses the boundary |
 |---|---|---|
-| **In-house video→image agent** | this app **calls** it | send the uploaded video reference → receive extracted snapshots |
-| **Upstream data app** | this app **calls** it | GET the property's EPC certificate + compliance data |
-| **Existing publishing app** | this app **calls** it | POST the approved, reviewed listing for downstream distribution |
+| **Self-hosted Keycloak** (identity) | this app **trusts** it | owners + reviewers log in against Keycloak (incl. email-OTP); this app validates the issued JWTs (OIDC) |
+| **In-house video→image agent** | this app **calls** it | send the uploaded video reference → receive extracted snapshots (REST) |
+| **Upstream data app** | this app **calls** it | GET the property's EPC certificate + compliance data (REST) |
+| **Existing publishing app** | this app **calls** it | POST the approved, reviewed listing for downstream distribution (REST) |
 
-Base URLs and API keys for all three live in **AWS Secrets Manager** — nothing
-is hardcoded in code or state.
+Base URLs and API keys for the three REST integrations live in **AWS Secrets
+Manager** — nothing is hardcoded in code or state. Keycloak is trusted purely by
+its OIDC issuer + JWKS (public keys); no secret is needed to validate its tokens.
 
 ## What's in the box
 
 | Path | What it is |
 |------|-----------|
 | `diagram/architecture.svg` / `.png` | Integration architecture with AWS icons |
-| `terraform/` | End-to-end IaC: network, WAF/security, Cognito email-OTP, S3+KMS, ElastiCache Redis, DynamoDB, API Gateway+JWT, the integration Lambdas (fetch-input-data · invoke-video-agent · generate-description), Step Functions HITL, publish hand-off, CloudFront SPAs, observability. Parameterized per environment. |
+| `terraform/` | End-to-end IaC: network, WAF/security, Keycloak JWT authorizer, S3+KMS, ElastiCache Redis, DynamoDB, API Gateway+JWT, the two REST integrations as native Step Functions HTTP Tasks (EventBridge API Connections), the generate-description Bedrock Lambda, Step Functions HITL, publish hand-off, CloudFront SPAs, observability. Parameterized per environment. |
 | `terraform/env/` | `stage.tfvars` / `prod.tfvars` + per-env remote-state backend configs |
-| `lambdas/` | Working source for the application + integration Lambdas |
-| `terraform/modules/identity/src/` | The Cognito email-OTP trigger Lambdas |
+| `lambdas/` | Working source for the 5 Lambdas: presign-upload, submit-for-review, review-callback, generate-description, publish-to-ecosystem |
+| `terraform/modules/identity/` | Keycloak coordinates (issuer/audience/roles) the API authorizer + SPAs consume — no AWS identity resources are created here |
 | `step-functions/onboarding.asl.json` | The human-in-the-loop state machine |
 | `docs/RUNBOOK.md` | Step-by-step provision → deploy → verify → promote to prod |
 | `docs/DECISION-LOG.md` | Every decision, the alternatives, and doc links |
@@ -42,11 +44,11 @@ is hardcoded in code or state.
 ## Architecture at a glance
 
 ```
-Owner (Node SPA on S3+CloudFront + Cognito email-OTP)
+Owner (Node SPA on S3+CloudFront; logs in via self-hosted Keycloak, email-OTP)
   --presigned PUT--> S3 raw-videos --EventBridge--> Step Functions:
-      fetch-input-data     --REST--> Upstream data app (EPC/compliance)
-      invoke-video-agent   --REST--> In-house video->image agent (snapshots)
-      generate-description --------> Bedrock Claude (description JSON)
+      FetchInputData (HTTP Task)  --REST--> Upstream data app (EPC/compliance)
+      InvokeVideoAgent (HTTP Task)--REST--> In-house video->image agent (snapshots)
+      generate-description (Lambda) -------> Bedrock Claude (description JSON)
       waitForTaskToken     <== human review console approves/rejects
   --approve--> ListingApproved --> publish-to-ecosystem --REST--> Existing publishing app
 In-journey wizard draft: ElastiCache Redis (TTL).  Region: eu-west-2.  IaC: Terraform stage->prod.
@@ -55,24 +57,27 @@ In-journey wizard draft: ElastiCache Redis (TTL).  Region: eu-west-2.  IaC: Terr
 ## The stack
 
 - **Frontend:** Node.js SPA (owner + reviewer) on **S3 + CloudFront** (OAC)
-- **Auth:** **Cognito email-OTP** (passwordless 6-digit code via **SES**)
+- **Auth:** **self-hosted Keycloak** (OIDC; passwordless email-OTP owned by Keycloak). API Gateway validates Keycloak JWTs; the SPAs use OIDC auth-code + PKCE
 - **In-journey state:** **ElastiCache for Redis** (TTL'd wizard draft)
 - **Upload:** presigned **S3** PUT via **API Gateway + Lambda**
 - **Orchestration:** **Step Functions** (Standard, human-in-the-loop)
-- **Integration:** REST connectors to the in-house video agent, the upstream
-  data app, and the publishing app (credentials in **Secrets Manager**)
+- **Integration:** the upstream data app and in-house video agent are called by
+  **native Step Functions HTTP Tasks** (no Lambda) via **EventBridge API
+  Connections** (which hold the API keys); the publishing app is called by the
+  `publish-to-ecosystem` Lambda (credentials in **Secrets Manager**)
 - **Description:** **Amazon Bedrock — Claude Sonnet** (vision) → structured JSON
 - **State:** **DynamoDB** single-table (`byStatus` / `byOwner` GSIs)
 - **Publish:** **EventBridge** → **publish-to-ecosystem** Lambda → existing app (+ DLQ)
-- **Security:** **WAF**, **Cognito JWT authorizer**, least-privilege **IAM**, **KMS**, private **VPC** for Redis
+- **Security:** **WAF**, **Keycloak JWT authorizer** (API Gateway), least-privilege **IAM**, **KMS**, private **VPC** for Redis
 - **Observability:** **CloudWatch**, **X-Ray**, **CloudTrail**, **GuardDuty**
 - **IaC:** **Terraform**, parameterized `env` (stage → prod), isolated remote state per environment, **eu-west-2**
 
 ## Quick start
 
 ```bash
-# Prereqs: terraform >= 1.6, AWS creds for the STAGE account, Node 20, an SES
-# verified sender, Bedrock model access in eu-west-2. See docs/RUNBOOK.md.
+# Prereqs: terraform >= 1.6, AWS creds for the STAGE account, Node 20, a
+# reachable Keycloak realm (issuer + client), Bedrock model access in eu-west-2.
+# See docs/RUNBOOK.md.
 ./build-lambdas.sh                       # install Lambda deps (optional)
 
 cd terraform

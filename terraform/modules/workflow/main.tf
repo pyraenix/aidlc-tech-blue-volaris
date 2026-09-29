@@ -1,15 +1,20 @@
 variable "name_prefix" { type = string }
 variable "listings_table_name" { type = string }
 variable "listings_table_arn" { type = string }
-variable "frames_bucket_name" { type = string }
 variable "event_bus_name" { type = string }
 variable "event_bus_arn" { type = string }
-variable "fetch_input_data_fn_arn" { type = string }
-variable "invoke_video_agent_fn_arn" { type = string }
 variable "generate_description_fn_arn" { type = string }
 variable "submit_for_review_fn_arn" { type = string }
 variable "owner_notify_topic_arn" { type = string }
 variable "ops_notify_topic_arn" { type = string }
+
+# --- Native HTTP Task integrations (upstream data app + in-house video agent) -
+variable "upstream_data_base_url" { type = string }
+variable "upstream_data_connection_arn" { type = string }
+variable "upstream_data_connection_secret_arn" { type = string }
+variable "video_agent_base_url" { type = string }
+variable "video_agent_connection_arn" { type = string }
+variable "video_agent_connection_secret_arn" { type = string }
 
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
@@ -40,12 +45,24 @@ resource "aws_iam_role_policy" "sfn" {
         Effect = "Allow"
         Action = ["lambda:InvokeFunction"]
         Resource = [
-          var.fetch_input_data_fn_arn,
-          var.invoke_video_agent_fn_arn,
           var.generate_description_fn_arn,
           var.submit_for_review_fn_arn,
         ]
       },
+      # Native HTTP Task: invoke external endpoints, restricted to the two known
+      # integration hosts (least-privilege via a StringLike on the endpoint).
+      {
+        Effect   = "Allow"
+        Action   = ["states:InvokeHTTPEndpoint"]
+        Resource = "*"
+        Condition = {
+          StringLike = {
+            "states:HTTPEndpoint" = ["${var.upstream_data_base_url}/*", "${var.video_agent_base_url}/*"]
+          }
+        }
+      },
+      { Effect = "Allow", Action = ["events:RetrieveConnectionCredentials"], Resource = [var.upstream_data_connection_arn, var.video_agent_connection_arn] },
+      { Effect = "Allow", Action = ["secretsmanager:GetSecretValue"], Resource = [var.upstream_data_connection_secret_arn, var.video_agent_connection_secret_arn] },
       { Effect = "Allow", Action = ["dynamodb:UpdateItem"], Resource = var.listings_table_arn },
       { Effect = "Allow", Action = ["events:PutEvents"], Resource = var.event_bus_arn },
       { Effect = "Allow", Action = ["sns:Publish"], Resource = [var.owner_notify_topic_arn, var.ops_notify_topic_arn] },
@@ -68,8 +85,10 @@ resource "aws_sfn_state_machine" "onboarding" {
   definition = templatefile("${path.root}/../step-functions/onboarding.asl.json", {
     ListingsTable                  = var.listings_table_name
     EventBusName                   = var.event_bus_name
-    FetchInputDataFunctionArn      = var.fetch_input_data_fn_arn
-    InvokeVideoAgentFunctionArn    = var.invoke_video_agent_fn_arn
+    UpstreamDataBaseUrl            = var.upstream_data_base_url
+    UpstreamDataConnectionArn      = var.upstream_data_connection_arn
+    VideoAgentBaseUrl              = var.video_agent_base_url
+    VideoAgentConnectionArn        = var.video_agent_connection_arn
     GenerateDescriptionFunctionArn = var.generate_description_fn_arn
     SubmitForReviewFunctionArn     = var.submit_for_review_fn_arn
     OwnerNotifyTopicArn            = var.owner_notify_topic_arn

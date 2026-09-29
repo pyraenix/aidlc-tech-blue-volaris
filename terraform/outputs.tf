@@ -1,9 +1,11 @@
 output "region" { value = var.region }
 output "environment" { value = var.env }
 
-# --- Auth -------------------------------------------------------------------
-output "cognito_user_pool_id" { value = module.identity.user_pool_id }
-output "cognito_user_pool_client_id" { value = module.identity.user_pool_client_id }
+# --- Auth (self-hosted Keycloak) --------------------------------------------
+output "keycloak_issuer" { value = module.identity.keycloak_issuer }
+output "keycloak_audience" { value = module.identity.keycloak_audience }
+output "reviewer_approver_role" { value = module.identity.reviewer_approver_role }
+output "reviewer_editor_role" { value = module.identity.reviewer_editor_role }
 
 # --- API --------------------------------------------------------------------
 output "api_base_url" { value = module.api.api_base_url }
@@ -27,11 +29,16 @@ output "event_bus_name" { value = module.events.event_bus_name }
 # --- Publish ----------------------------------------------------------------
 output "publish_dlq_url" { value = module.publish.publish_dlq_url }
 
-# --- Integration secrets to populate (set base URL + apiKey before use) -----
-output "integration_secrets" {
+# --- Integration ------------------------------------------------------------
+# The publishing app still uses a Secrets Manager secret (populate base URL +
+# apiKey before use). The upstream data app + video agent authenticate via
+# EventBridge API Connections instead (their API keys are set at apply time via
+# TF_VAR_upstream_data_api_key / TF_VAR_video_agent_api_key).
+output "publish_app_secret_arn" { value = module.integration.publish_app_secret_arn }
+
+output "integration_connections" {
   value = {
-    video_agent = module.integration.video_agent_secret_arn
-    input_data  = module.integration.input_data_secret_arn
-    publish_app = module.integration.publish_app_secret_arn
+    upstream_data = module.integration.upstream_data_connection_arn
+    video_agent   = module.integration.video_agent_connection_arn
   }
 }

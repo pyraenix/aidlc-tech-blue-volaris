@@ -20,7 +20,7 @@ resource "aws_subnet" "private" {
 }
 
 # Public subnets only exist to host the NAT gateway (Lambdas need egress for
-# SES/Bedrock/AWS APIs). No workload is placed here.
+# Bedrock, the REST integrations, and other AWS APIs). No workload is placed here.
 resource "aws_subnet" "public" {
   count             = 2
   vpc_id            = aws_vpc.main.id
@@ -83,7 +83,7 @@ resource "aws_security_group" "lambda" {
   vpc_id      = aws_vpc.main.id
 
   egress {
-    description = "All egress (SES, Bedrock, AWS APIs via NAT)."
+    description = "All egress (Bedrock, REST integrations, AWS APIs via NAT)."
     from_port   = 0
     to_port     = 0
     protocol    = "-1"

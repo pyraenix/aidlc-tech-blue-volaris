@@ -1,8 +1,7 @@
 variable "name_prefix" { type = string }
-variable "region" { type = string }
 variable "app_domains" { type = list(string) }
-variable "user_pool_id" { type = string }
-variable "user_pool_client_id" { type = string }
+variable "keycloak_issuer" { type = string }
+variable "keycloak_audience" { type = list(string) }
 variable "raw_videos_bucket" { type = string }
 variable "max_upload_mb" { type = number }
 variable "listings_table_arn" { type = string }
@@ -12,18 +11,19 @@ variable "vpc_subnet_ids" { type = list(string) }
 variable "lambda_sg_id" { type = string }
 variable "waf_acl_arn" { type = string }
 
-data "aws_region" "current" {}
-data "aws_caller_identity" "current" {}
-
 # ===========================================================================
-# HTTP API (API Gateway v2) with a Cognito JWT authorizer.
+# HTTP API (API Gateway v2) with a JWT authorizer that trusts self-hosted
+# Keycloak.
 # Routes:
 #   POST /presign          (auth)   -> presign-upload
 #   POST /listings/submit  (auth)   -> submit-for-review draft->pipeline
 #   POST /review/decision  (auth)   -> review-callback (SendTaskSuccess/Failure)
-# The OTP flow itself is handled by Cognito's InitiateAuth/RespondToAuthChallenge
-# (CUSTOM_AUTH) directly from the browser SDK — no custom route needed. WAF's
-# OtpRequestRateLimit protects the Cognito domain endpoint at the edge.
+# Login (incl. passwordless email-OTP) is owned entirely by Keycloak: the SPAs
+# run the OIDC auth-code + PKCE flow against Keycloak directly, then call these
+# routes with the resulting bearer token. The authorizer validates each token
+# against Keycloak's OIDC issuer / JWKS. Because API Gateway's native JWT
+# authorizer fetches JWKS over the public internet, keycloak_issuer must be a
+# publicly reachable https URL.
 # ===========================================================================
 
 resource "aws_apigatewayv2_api" "main" {
@@ -41,10 +41,10 @@ resource "aws_apigatewayv2_authorizer" "jwt" {
   api_id           = aws_apigatewayv2_api.main.id
   authorizer_type  = "JWT"
   identity_sources = ["$request.header.Authorization"]
-  name             = "${var.name_prefix}-cognito-jwt"
+  name             = "${var.name_prefix}-keycloak-jwt"
   jwt_configuration {
-    audience = [var.user_pool_client_id]
-    issuer   = "https://cognito-idp.${var.region}.amazonaws.com/${var.user_pool_id}"
+    audience = var.keycloak_audience
+    issuer   = var.keycloak_issuer
   }
 }
 

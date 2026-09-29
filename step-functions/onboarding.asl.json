@@ -1,5 +1,5 @@
 {
-  "Comment": "TechBlue property onboarding — an integration component of a larger UK-market ecosystem. Started by EventBridge on raw video upload. FetchInputData (EPC/compliance from upstream app) -> InvokeVideoAgent (TechBlue in-house agent, REST) -> GenerateDescription (Bedrock Claude) -> human review (waitForTaskToken) -> PublishToEcosystem (hand off to existing publishing app).",
+  "Comment": "TechBlue property onboarding — an integration component of a larger UK-market ecosystem. Started by EventBridge on raw video upload. FetchInputData (EPC/compliance from upstream app, native HTTP Task) -> InvokeVideoAgent (TechBlue in-house agent, native HTTP Task) -> GenerateDescription (Bedrock Claude, Lambda) -> human review (waitForTaskToken) -> ListingApproved -> publish-to-ecosystem Lambda hands off to the existing publishing app. The two REST integrations use Step Functions' native HTTP Task via EventBridge API Connections (the connection injects the x-api-key), so no Lambda wraps them.",
   "StartAt": "MarkProcessing",
   "States": {
     "MarkProcessing": {
@@ -13,52 +13,99 @@
         "ExpressionAttributeValues": { ":s": { "S": "PROCESSING" } }
       },
       "ResultPath": null,
+      "Next": "ResolvePropertyRef"
+    },
+
+    "ResolvePropertyRef": {
+      "Comment": "propertyRef is the shared ecosystem identifier (e.g. UPRN). Fall back to listingId when the execution input did not carry one.",
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.propertyRef", "IsPresent": true, "Next": "FetchInputData" }
+      ],
+      "Default": "DefaultPropertyRef"
+    },
+
+    "DefaultPropertyRef": {
+      "Type": "Pass",
+      "Parameters": { "propertyRef.$": "$.listingId" },
+      "ResultPath": "$",
+      "OutputPath": "$",
       "Next": "FetchInputData"
     },
 
     "FetchInputData": {
-      "Comment": "INTEGRATION: pull EPC certificate + compliance data from the upstream ecosystem app (REST).",
+      "Comment": "INTEGRATION (native HTTP Task): GET EPC/compliance from the upstream app. 404 -> proceed with empty inputs flagged for the reviewer; other non-2xx -> fail. The API Connection injects the x-api-key header.",
       "Type": "Task",
-      "Resource": "arn:aws:states:::lambda:invoke",
+      "Resource": "arn:aws:states:::http:invoke",
       "Parameters": {
-        "FunctionName": "${FetchInputDataFunctionArn}",
-        "Payload": {
-          "listingId.$": "$.listingId",
-          "propertyRef.$": "$.propertyRef"
-        }
+        "ApiEndpoint.$": "States.Format('${UpstreamDataBaseUrl}/properties/{}/compliance', $.propertyRef)",
+        "Method": "GET",
+        "Authentication": { "ConnectionArn": "${UpstreamDataConnectionArn}" },
+        "Headers": { "Accept": "application/json" }
       },
-      "ResultSelector": { "inputData.$": "$.Payload.inputData" },
-      "ResultPath": "$.upstream",
+      "ResultSelector": {
+        "epc.$": "$.ResponseBody.epc",
+        "compliance.$": "$.ResponseBody.compliance",
+        "missing": false
+      },
+      "ResultPath": "$.upstream.inputData",
       "Retry": [
-        { "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException", "Lambda.TooManyRequestsException"], "IntervalSeconds": 5, "MaxAttempts": 3, "BackoffRate": 2.0 }
+        { "ErrorEquals": ["States.Http.StatusCode.429", "States.Http.StatusCode.500", "States.Http.StatusCode.502", "States.Http.StatusCode.503", "States.Http.StatusCode.504", "States.Timeout"], "IntervalSeconds": 5, "MaxAttempts": 3, "BackoffRate": 2.0 }
       ],
       "Catch": [
+        { "ErrorEquals": ["States.Http.StatusCode.404"], "ResultPath": "$.upstream.inputData", "Next": "InputDataMissing" },
         { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }
       ],
       "Next": "InvokeVideoAgent"
     },
 
+    "InputDataMissing": {
+      "Comment": "No upstream record yet — proceed with empty inputs; the reviewer will flag it.",
+      "Type": "Pass",
+      "Parameters": { "epc": null, "compliance": null, "missing": true },
+      "ResultPath": "$.upstream.inputData",
+      "Next": "InvokeVideoAgent"
+    },
+
     "InvokeVideoAgent": {
-      "Comment": "INTEGRATION: call TechBlue's in-house video->image agent (REST). It returns the extracted snapshots.",
+      "Comment": "INTEGRATION (native HTTP Task): POST the uploaded video reference to TechBlue's in-house video->image agent; it returns extracted snapshots. The API Connection injects the x-api-key header.",
       "Type": "Task",
-      "Resource": "arn:aws:states:::lambda:invoke",
+      "Resource": "arn:aws:states:::http:invoke",
       "Parameters": {
-        "FunctionName": "${InvokeVideoAgentFunctionArn}",
-        "Payload": {
+        "ApiEndpoint": "${VideoAgentBaseUrl}/extract",
+        "Method": "POST",
+        "Authentication": { "ConnectionArn": "${VideoAgentConnectionArn}" },
+        "Headers": { "Content-Type": "application/json" },
+        "RequestBody": {
           "listingId.$": "$.listingId",
-          "rawVideoKey.$": "$.rawVideoKey",
-          "rawBucket.$": "$.rawBucket"
+          "video": { "bucket.$": "$.rawBucket", "key.$": "$.rawVideoKey" }
         }
       },
-      "ResultSelector": { "snapshots.$": "$.Payload.snapshots" },
+      "ResultSelector": { "snapshots.$": "$.ResponseBody.snapshots" },
       "ResultPath": "$.agent",
       "Retry": [
-        { "ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 10, "MaxAttempts": 3, "BackoffRate": 2.0 }
+        { "ErrorEquals": ["States.Http.StatusCode.429", "States.Http.StatusCode.500", "States.Http.StatusCode.502", "States.Http.StatusCode.503", "States.Http.StatusCode.504", "States.Timeout"], "IntervalSeconds": 10, "MaxAttempts": 3, "BackoffRate": 2.0 }
       ],
       "Catch": [
         { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }
       ],
-      "Next": "GenerateDescription"
+      "Next": "ValidateSnapshots"
+    },
+
+    "ValidateSnapshots": {
+      "Comment": "The agent must return at least one snapshot; otherwise fail (mirrors the old Lambda's guard).",
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.agent.snapshots[0]", "IsPresent": true, "Next": "GenerateDescription" }
+      ],
+      "Default": "NoSnapshots"
+    },
+
+    "NoSnapshots": {
+      "Type": "Pass",
+      "Parameters": { "Error": "NoSnapshots", "Cause": "video agent returned no snapshots" },
+      "ResultPath": "$.error",
+      "Next": "MarkFailed"
     },
 
     "GenerateDescription": {

@@ -47,16 +47,21 @@ snapshot selection and any moderation are the agent's responsibility.
 **Why:** TechBlue already has this agent; this component only integrates with it.
 Modelled as a Step Functions Task so the surrounding flow is unchanged if the
 agent's transport later changes.
-📄 [Step Functions — call a REST endpoint via Lambda](https://docs.aws.amazon.com/step-functions/latest/dg/connect-lambda.html)
+**Update (DL-20):** this call is now a **native Step Functions HTTP Task** (via
+an EventBridge API Connection), not a Lambda — the Lambda was a thin REST
+wrapper with no logic beyond an empty-result guard, which is now a `Choice`.
+📄 [Step Functions — call HTTPS APIs (HTTP Task)](https://docs.aws.amazon.com/step-functions/latest/dg/connect-third-party-apis.html)
 
 ## DL-05 — Input data: fetch EPC/compliance from the upstream app (REST)
-**Decision:** The `fetch-input-data` Lambda GETs the property's EPC certificate
-and compliance data from the upstream app early in the pipeline, keyed on a
-shared property reference (e.g. UPRN in the UK). A 404 proceeds with empty inputs
-flagged for the reviewer.
+**Decision:** GET the property's EPC certificate and compliance data from the
+upstream app early in the pipeline, keyed on a shared property reference (e.g.
+UPRN in the UK). A 404 proceeds with empty inputs flagged for the reviewer.
 *Alternatives:* have owners re-enter compliance data by hand.
 **Why:** The authoritative data already lives upstream; pulling it avoids
 re-keying, keeps the description grounded, and gives the reviewer the real EPC.
+**Update (DL-20):** this is now a **native Step Functions HTTP Task**; the
+404-tolerance is a `Catch` on `States.Http.StatusCode.404` routing to a Pass
+state that sets `missing:true` (was Lambda `if (status===404)`).
 📄 [Well-Architected — integrate through well-defined APIs](https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/rel_prevent_interaction_failure_service_contracts.html)
 
 ## DL-06 — Publish: hand off approved listing to the existing publishing app (REST)
@@ -80,26 +85,31 @@ region supports UK GDPR data-residency expectations.
 📄 [AWS Regions](https://docs.aws.amazon.com/general/latest/gr/rande.html) ·
 [CloudFront WAF must be us-east-1](https://docs.aws.amazon.com/waf/latest/developerguide/how-aws-waf-works-resources.html)
 
-## DL-08 — Auth: Cognito email-OTP passwordless
-**Decision:** Cognito user pool with a custom authentication flow (passwordless
-6-digit email code) via the three challenge triggers, delivering the code
-through SES.
+## DL-08 — Auth: Cognito email-OTP passwordless — ⚠️ SUPERSEDED by DL-19
+**Decision (original):** Cognito user pool with a custom authentication flow
+(passwordless 6-digit email code) via the three challenge triggers, delivering
+the code through SES.
 *Alternatives:* home-grown "generate a code, store in Redis, email it"; Okta.
-**Why:** Keeps the existing 6-digit-code UX but hands the security-sensitive
-parts — attempt caps, code expiry, token issuance/refresh, lockout — to Cognito,
-and plugs straight into the API Gateway JWT authorizer.
-📄 [Custom authentication challenge Lambda triggers](https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-lambda-challenge.html) ·
-[Define Auth challenge trigger](https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-lambda-define-auth-challenge.html)
+**Why (original):** Keeps the existing 6-digit-code UX but hands the
+security-sensitive parts — attempt caps, code expiry, token issuance/refresh,
+lockout — to Cognito, and plugs straight into the API Gateway JWT authorizer.
+**Superseded:** The ecosystem standardizes identity on a self-hosted Keycloak
+that already owns login and email-OTP. See DL-19 — Cognito, its OTP trigger
+Lambdas, and SES were removed.
+📄 [Custom authentication challenge Lambda triggers](https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-lambda-challenge.html)
 
-## DL-09 — OTP brute-force / flooding defense
-**Decision:** 3-attempt cap per code (via `DefineAuthChallenge`), CSPRNG code,
-timing-safe compare, short TTL, one code reused across retries in a session,
-plus a WAF rate-based rule scoped to the OTP path and API Gateway throttling.
-**Why:** A 6-digit code is only 1,000,000 values; the defense that matters is
-limiting guesses per code and requests per IP. Cognito enforces the per-session
-cap; WAF stops floods at the edge.
-📄 [Verify Auth challenge response trigger](https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-lambda-verify-auth-challenge-response.html) ·
-[WAF rate-based rules](https://docs.aws.amazon.com/waf/latest/developerguide/waf-rule-statement-type-rate-based.html)
+## DL-09 — OTP brute-force / flooding defense — ⚠️ SUPERSEDED by DL-19
+**Decision (original):** 3-attempt cap per code (via `DefineAuthChallenge`),
+CSPRNG code, timing-safe compare, short TTL, one code reused across retries in a
+session, plus a WAF rate-based rule scoped to the OTP path and API Gateway
+throttling.
+**Why (original):** A 6-digit code is only 1,000,000 values; the defense that
+matters is limiting guesses per code and requests per IP.
+**Superseded:** OTP is now issued and verified by Keycloak, so per-code attempt
+caps and OTP-flood throttling move to Keycloak's edge. The WAF `OtpRequestRateLimit`
+rule (scoped to `/auth/request-otp`, a route that no longer exists on this API)
+was removed. The global API rate limit and API Gateway throttling remain. See DL-19.
+📄 [WAF rate-based rules](https://docs.aws.amazon.com/waf/latest/developerguide/waf-rule-statement-type-rate-based.html)
 
 ## DL-10 — In-journey draft state: ElastiCache for Redis
 **Decision:** Hold the active wizard draft in ElastiCache for Redis with a TTL;
@@ -134,17 +144,21 @@ own secret; S3 CORS is locked to `app_domains`, never `*`.
 📄 [IAM least-privilege](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html#grant-least-privilege) ·
 [S3 CORS](https://docs.aws.amazon.com/AmazonS3/latest/userguide/cors.html)
 
-## DL-14 — API auth: API Gateway HTTP API + Cognito JWT authorizer
-**Decision:** HTTP API with a JWT authorizer validating Cognito tokens; server
-side enforces `ownerId == token.sub` and reviewer group membership.
+## DL-14 — API auth: API Gateway HTTP API + JWT authorizer (updated by DL-19)
+**Decision:** HTTP API with a JWT authorizer; server side enforces
+`ownerId == token.sub` and reviewer role membership.
 **Why:** Native JWT validation rejects bad tokens before the Lambda runs;
 ownership/role checks must be server-side, never trusting the UI.
+**Update (DL-19):** the authorizer now validates **Keycloak**-issued tokens
+(issuer + JWKS), not Cognito. Reviewer authority comes from a Keycloak role
+claim (`keycloak_roles_claim`, e.g. `realm_access.roles`) instead of Cognito
+groups.
 📄 [HTTP API JWT authorizers](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-jwt-authorizer.html)
 
 ## DL-15 — Edge security: AWS WAF on API Gateway and CloudFront
 **Decision:** Two WAF web ACLs (REGIONAL for the API in eu-west-2, CLOUDFRONT for
 the SPAs in us-east-1) with managed rule groups, IP reputation, a global rate
-limit, and the tight OTP-path rate limit.
+limit. (The OTP-path rate limit was removed with the move to Keycloak — see DL-09/DL-19.)
 **Why:** Defense in depth — stop SQLi/XSS, bad IPs, and floods at the edge before
 compute runs.
 📄 [WAF managed rule groups](https://docs.aws.amazon.com/waf/latest/developerguide/aws-managed-rule-groups-list.html)
@@ -173,13 +187,66 @@ a failed-execution alarm; CloudTrail audit; GuardDuty.
 undebuggable without distributed tracing and per-step logs.
 📄 [X-Ray with Lambda](https://docs.aws.amazon.com/lambda/latest/dg/services-xray.html)
 
+## DL-19 — Auth: self-hosted Keycloak instead of Cognito (supersedes DL-08/09)
+**Decision:** Use the ecosystem's existing **self-hosted Keycloak** as the
+identity provider. Keycloak owns the full login lifecycle, including passwordless
+email-OTP. This app creates no identity resources: the `identity` module is a
+thin pass-through of Keycloak coordinates (`keycloak_issuer`, `keycloak_audience`,
+`keycloak_roles_claim`, reviewer role names), the API Gateway JWT authorizer
+validates Keycloak tokens, and the SPAs authenticate via OIDC auth-code + PKCE
+against Keycloak. Removed: the Cognito user pool + app client + groups, the three
+`CUSTOM_AUTH` trigger Lambdas and their IAM role, the SES send policy, and the
+WAF OTP-path rule.
+*Alternatives:* keep Cognito and federate it to Keycloak (OIDC broker); migrate
+users into Cognito.
+**Why:** The ecosystem standardizes on Keycloak, which already runs email-OTP for
+these users. A second IdP (Cognito) would mean two user stores and two places to
+manage reviewers. Trusting Keycloak's JWTs keeps this component a pure integration
+consumer of identity — consistent with DL-02.
+**Assumptions / to confirm:** (a) Keycloak's OIDC issuer/JWKS is **publicly
+reachable** so API Gateway's native JWT authorizer can fetch keys — if Keycloak
+is VPC-internal, this must become a VPC Lambda authorizer instead; (b) the real
+issuer URL, client `aud`, and reviewer role claim (the tfvars ship placeholders).
+📄 [HTTP API JWT authorizers (any OIDC IdP)](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-jwt-authorizer.html) ·
+[Keycloak — OIDC endpoints](https://www.keycloak.org/docs/latest/securing_apps/#_oidc)
+
+## DL-20 — Fewer Lambdas: the two REST calls become native HTTP Tasks
+**Decision:** Convert `fetch-input-data` and `invoke-video-agent` from Lambdas to
+**native Step Functions HTTP Tasks** (`arn:aws:states:::http:invoke`) that
+authenticate via **EventBridge API Connections** (the connection stores the
+`x-api-key` in a connection-managed Secrets Manager secret and injects it). The
+small amounts of logic move into ASL: `propertyRef || listingId` becomes a
+`Choice`, the upstream 404-tolerance a `Catch` + Pass, and the video agent's
+empty-snapshot guard a `Choice`. This takes the app from 7 Lambdas to 5.
+*Alternatives:* (a) keep the two wrapper Lambdas; (b) also fold
+`generate-description` and `publish-to-ecosystem` in (rejected — see below).
+**Why:** Both were thin REST wrappers whose only real work was sending a request
+and shaping the response — exactly what HTTP Tasks do natively. Removing them
+cuts deployable code, IAM roles, and cold-start surface, and the API Connection
+handles the credential more cleanly than a `GetSecretValue` in code.
+**Deliberately kept as Lambdas (strong reasons):**
+- `generate-description` — assembles a multimodal Bedrock payload (base64 images)
+  and does a JSON parse-and-retry loop that ASL cannot express.
+- `publish-to-ecosystem` — an **event-driven** target of `ListingApproved` with
+  its own EventBridge retry + SQS DLQ; folding it into the state machine would
+  trade away that decoupling and independent failure handling.
+- `presign-upload`, `submit-for-review`, `review-callback` — per-request API
+  Gateway handlers.
+**Trade-off:** HTTP Task request/response shaping is expressed in ASL (JSONPath),
+which is less flexible than JS if a contract needs heavy transformation. If either
+external contract grows complex, that call can move back into a Lambda.
+📄 [Step Functions — call third-party HTTPS APIs](https://docs.aws.amazon.com/step-functions/latest/dg/connect-third-party-apis.html) ·
+[EventBridge connections](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-api-destination-connection.html)
+
 ---
 
 ## Open items to confirm before go-live
 1. **REST contracts** for the three external systems — exact request/response
    shapes, auth scheme, and the shared property reference (UPRN?). The Lambdas
    assume sensible contracts; align them to the real APIs.
-2. **Owner directory** — internal vs external users (Cognito config only).
+2. **Keycloak coordinates** — confirm the real realm issuer URL, client `aud`,
+   and reviewer role claim, and that the issuer/JWKS is publicly reachable from
+   API Gateway (else switch to a VPC Lambda authorizer). tfvars ship placeholders.
 3. **Redis today** — self-managed vs ElastiCache; this package provisions
    ElastiCache. If they keep their own, drop the `cache` module and point at it.
 4. **Video/volume profile** — to right-size Bedrock spend and confirm Standard

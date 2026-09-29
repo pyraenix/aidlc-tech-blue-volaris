@@ -1,0 +1,207 @@
+{
+  "Comment": "TechBlue property onboarding — an integration component of a larger UK-market ecosystem. Started by EventBridge on raw video upload. FetchInputData (EPC/compliance from upstream app) -> InvokeVideoAgent (TechBlue in-house agent, REST) -> GenerateDescription (Bedrock Claude) -> human review (waitForTaskToken) -> PublishToEcosystem (hand off to existing publishing app).",
+  "StartAt": "MarkProcessing",
+  "States": {
+    "MarkProcessing": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${ListingsTable}",
+        "Key": { "PK": { "S.$": "States.Format('LISTING#{}', $.listingId)" }, "SK": { "S": "META" } },
+        "UpdateExpression": "SET #s = :s",
+        "ExpressionAttributeNames": { "#s": "status" },
+        "ExpressionAttributeValues": { ":s": { "S": "PROCESSING" } }
+      },
+      "ResultPath": null,
+      "Next": "FetchInputData"
+    },
+
+    "FetchInputData": {
+      "Comment": "INTEGRATION: pull EPC certificate + compliance data from the upstream ecosystem app (REST).",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${FetchInputDataFunctionArn}",
+        "Payload": {
+          "listingId.$": "$.listingId",
+          "propertyRef.$": "$.propertyRef"
+        }
+      },
+      "ResultSelector": { "inputData.$": "$.Payload.inputData" },
+      "ResultPath": "$.upstream",
+      "Retry": [
+        { "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException", "Lambda.TooManyRequestsException"], "IntervalSeconds": 5, "MaxAttempts": 3, "BackoffRate": 2.0 }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }
+      ],
+      "Next": "InvokeVideoAgent"
+    },
+
+    "InvokeVideoAgent": {
+      "Comment": "INTEGRATION: call TechBlue's in-house video->image agent (REST). It returns the extracted snapshots.",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${InvokeVideoAgentFunctionArn}",
+        "Payload": {
+          "listingId.$": "$.listingId",
+          "rawVideoKey.$": "$.rawVideoKey",
+          "rawBucket.$": "$.rawBucket"
+        }
+      },
+      "ResultSelector": { "snapshots.$": "$.Payload.snapshots" },
+      "ResultPath": "$.agent",
+      "Retry": [
+        { "ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 10, "MaxAttempts": 3, "BackoffRate": 2.0 }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }
+      ],
+      "Next": "GenerateDescription"
+    },
+
+    "GenerateDescription": {
+      "Comment": "Bedrock Claude (vision) on the agent's snapshots + owner details + EPC/compliance -> strict JSON draft.",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${GenerateDescriptionFunctionArn}",
+        "Payload": {
+          "listingId.$": "$.listingId",
+          "snapshots.$": "$.agent.snapshots",
+          "ownerDetails.$": "$.ownerDetails",
+          "inputData.$": "$.upstream.inputData"
+        }
+      },
+      "ResultSelector": { "listing.$": "$.Payload.listing" },
+      "ResultPath": "$.generated",
+      "Retry": [
+        { "ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 5, "MaxAttempts": 3, "BackoffRate": 2.0 }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }
+      ],
+      "Next": "SaveDraftAndRequestReview"
+    },
+
+    "SaveDraftAndRequestReview": {
+      "Comment": "HUMAN-IN-THE-LOOP. waitForTaskToken pauses until a reviewer submits a decision via /review/decision (SendTaskSuccess/SendTaskFailure).",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "TimeoutSeconds": 604800,
+      "Parameters": {
+        "FunctionName": "${SubmitForReviewFunctionArn}",
+        "Payload": {
+          "listingId.$": "$.listingId",
+          "draft.$": "$.generated.listing",
+          "snapshots.$": "$.agent.snapshots",
+          "inputData.$": "$.upstream.inputData",
+          "taskToken.$": "$$.Task.Token"
+        }
+      },
+      "ResultPath": "$.review",
+      "Catch": [
+        { "ErrorEquals": ["ReviewRejected"], "ResultPath": "$.review", "Next": "MarkRejected" },
+        { "ErrorEquals": ["States.Timeout"], "ResultPath": "$.error", "Next": "NotifyReviewTimeout" }
+      ],
+      "Next": "MarkApproved"
+    },
+
+    "MarkApproved": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${ListingsTable}",
+        "Key": { "PK": { "S.$": "States.Format('LISTING#{}', $.listingId)" }, "SK": { "S": "META" } },
+        "UpdateExpression": "SET #s = :s",
+        "ExpressionAttributeNames": { "#s": "status" },
+        "ExpressionAttributeValues": { ":s": { "S": "APPROVED" } }
+      },
+      "ResultPath": null,
+      "Next": "EmitListingApproved"
+    },
+
+    "EmitListingApproved": {
+      "Comment": "Emits ListingApproved; the publish-to-ecosystem Lambda (EventBridge target) hands the listing to the existing publishing app.",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::events:putEvents",
+      "Parameters": {
+        "Entries": [
+          {
+            "EventBusName": "${EventBusName}",
+            "Source": "techblue.onboarding",
+            "DetailType": "ListingApproved",
+            "Detail": { "listingId.$": "$.listingId" }
+          }
+        ]
+      },
+      "ResultPath": null,
+      "Next": "NotifyOwnerApproved"
+    },
+
+    "NotifyOwnerApproved": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${OwnerNotifyTopicArn}",
+        "Message.$": "States.Format('Your listing {} has been approved and handed off for publishing.', $.listingId)"
+      },
+      "End": true
+    },
+
+    "MarkRejected": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${ListingsTable}",
+        "Key": { "PK": { "S.$": "States.Format('LISTING#{}', $.listingId)" }, "SK": { "S": "META" } },
+        "UpdateExpression": "SET #s = :s",
+        "ExpressionAttributeNames": { "#s": "status" },
+        "ExpressionAttributeValues": { ":s": { "S": "REJECTED" } }
+      },
+      "ResultPath": null,
+      "Next": "NotifyOwnerRejected"
+    },
+
+    "NotifyOwnerRejected": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${OwnerNotifyTopicArn}",
+        "Message.$": "States.Format('Your listing {} needs changes before it can be published.', $.listingId)"
+      },
+      "End": true
+    },
+
+    "NotifyReviewTimeout": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${OpsNotifyTopicArn}",
+        "Message.$": "States.Format('Review for listing {} timed out after 7 days.', $.listingId)"
+      },
+      "Next": "MarkFailed"
+    },
+
+    "MarkFailed": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${ListingsTable}",
+        "Key": { "PK": { "S.$": "States.Format('LISTING#{}', $.listingId)" }, "SK": { "S": "META" } },
+        "UpdateExpression": "SET #s = :s",
+        "ExpressionAttributeNames": { "#s": "status" },
+        "ExpressionAttributeValues": { ":s": { "S": "FAILED" } }
+      },
+      "ResultPath": null,
+      "Next": "FailState"
+    },
+
+    "FailState": {
+      "Type": "Fail",
+      "Error": "OnboardingFailed",
+      "Cause": "Processing, integration, or review failed; see the listing record and execution history."
+    }
+  }
+}

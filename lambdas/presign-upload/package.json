@@ -1,0 +1,7 @@
+{
+  "name": "techblue-presign-upload",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.js",
+  "dependencies": { "@aws-sdk/client-s3": "^3.600.0", "@aws-sdk/s3-presigned-post": "^3.600.0" }
+}

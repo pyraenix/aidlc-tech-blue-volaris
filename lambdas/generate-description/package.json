@@ -1,0 +1,7 @@
+{
+  "name": "techblue-generate-description",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.js",
+  "dependencies": { "@aws-sdk/client-bedrock-runtime": "^3.600.0", "@aws-sdk/client-s3": "^3.600.0" }
+}
